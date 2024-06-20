@@ -99,25 +99,55 @@ async fn observer(
     let permissions: std::fs::Permissions =
         PermissionsExt::from_mode(config.observation_permissions);
 
-    let sources_listener = create_unix_socket_with_permissions(&path, permissions)?;
+    let observe_listener = create_unix_socket_with_permissions(&path, permissions)?;
 
     loop {
-        let (mut stream, _addr) = sources_listener.accept().await?;
+        let (mut stream, _addr) = observe_listener.accept().await?;
+        let sources_reader = sources_reader.clone();
+        let server_reader = server_reader.clone();
+        let system_reader = system_reader.clone();
 
-        let observe = ObservableState {
-            program: ProgramData::with_uptime(start_time.elapsed().as_secs_f64()),
-            sources: sources_reader
-                .read()
-                .expect("Unexpected poisoned mutex")
-                .values()
-                .cloned()
-                .collect(),
-            system: *system_reader.borrow(),
-            servers: server_reader.borrow().iter().map(|s| s.into()).collect(),
+        let fut = async move {
+            handle_connection(
+                &mut stream,
+                start_time,
+                &sources_reader,
+                server_reader,
+                system_reader,
+            )
+            .await
         };
 
-        super::sockets::write_json(&mut stream, &observe).await?;
+        tokio::spawn(async move {
+            if let Err(e) = fut.await {
+                tracing::warn!("error handling connection: {e}");
+            }
+        });
     }
+}
+
+async fn handle_connection(
+    stream: &mut (impl tokio::io::AsyncWrite + Unpin),
+    start_time: Instant,
+    sources_reader: &std::sync::RwLock<HashMap<SourceId, ObservableSourceState<SourceId>>>,
+    server_reader: tokio::sync::watch::Receiver<Vec<ServerData>>,
+    system_reader: tokio::sync::watch::Receiver<SystemSnapshot>,
+) -> std::io::Result<()> {
+    let observe = ObservableState {
+        program: ProgramData::with_uptime(start_time.elapsed().as_secs_f64()),
+        sources: sources_reader
+            .read()
+            .expect("Unexpected poisoned mutex")
+            .values()
+            .cloned()
+            .collect(),
+        system: *system_reader.borrow(),
+        servers: server_reader.borrow().iter().map(|s| s.into()).collect(),
+    };
+
+    super::sockets::write_json(stream, &observe).await?;
+
+    Ok(())
 }
 
 #[cfg(test)]

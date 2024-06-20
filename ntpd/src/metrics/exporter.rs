@@ -5,6 +5,7 @@ use tokio::net::TcpListener;
 use std::{
     fmt::Write,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use crate::daemon::{config::CliArg, initialize_logging_parse_config, ObservableState};
@@ -125,7 +126,7 @@ async fn run(options: NtpMetricsExporterOptions) -> Result<(), Box<dyn std::erro
     let config = initialize_logging_parse_config(None, options.config).await;
 
     let observation_socket_path = match config.observability.observation_path {
-        Some(path) => path,
+        Some(path) => Arc::new(path),
         None => {
             eprintln!("An observation socket path must be configured using the observation-path option in the [observability] section of the configuration");
             std::process::exit(1);
@@ -158,29 +159,44 @@ async fn run(options: NtpMetricsExporterOptions) -> Result<(), Box<dyn std::erro
             Ok(listener) => break listener,
         };
     };
-    let mut buf = String::with_capacity(4 * 1024);
 
     loop {
         let (mut tcp_stream, _) = listener.accept().await?;
+        let path = observation_socket_path.clone();
 
-        buf.clear();
-        match handler(&mut buf, &observation_socket_path).await {
-            Ok(()) => {
-                tcp_stream.write_all(buf.as_bytes()).await?;
+        // handle each connection on a separate task
+        let fut = async move { handle_connection(&mut tcp_stream, &path).await };
+
+        tokio::spawn(async move {
+            if let Err(e) = fut.await {
+                tracing::warn!("error handling connection: {e}");
             }
-            Err(e) => {
-                tracing::warn!("hit an error: {e}");
+        });
+    }
+}
 
-                const ERROR_REPONSE: &str = concat!(
-                    "HTTP/1.1 500 Internal Server Error\r\n",
-                    "content-type: text/plain\r\n",
-                    "content-length: 0\r\n\r\n",
-                );
+async fn handle_connection(
+    stream: &mut (impl tokio::io::AsyncWrite + Unpin),
+    observation_socket_path: &Path,
+) -> std::io::Result<()> {
+    let mut buf = String::with_capacity(4 * 1024);
+    match handler(&mut buf, observation_socket_path).await {
+        Ok(()) => {
+            stream.write_all(buf.as_bytes()).await?;
+        }
+        Err(e) => {
+            tracing::warn!("hit an error: {e}");
 
-                tcp_stream.write_all(ERROR_REPONSE.as_bytes()).await?;
-            }
+            const ERROR_REPONSE: &str = concat!(
+                "HTTP/1.1 500 Internal Server Error\r\n",
+                "content-type: text/plain\r\n",
+                "content-length: 0\r\n\r\n",
+            );
+
+            stream.write_all(ERROR_REPONSE.as_bytes()).await?;
         }
     }
+    Ok(())
 }
 
 async fn handler(buf: &mut String, observation_socket_path: &Path) -> std::io::Result<()> {
